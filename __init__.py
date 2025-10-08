@@ -8,6 +8,242 @@ from .menu_injector import register_menu_item, unregister_menu_item
 bl_info = parse_manifest({"location": "3D View > Object (menu)", "category": "Object"})
 
 import bpy
+import sys
+from dataclasses import dataclass
+
+if sys.platform.startswith("win"):
+    import ctypes  # type: ignore[import-not-found]
+    _VK_MENU = 0x12
+
+    def _system_alt_state() -> bool | None:
+        try:
+            return bool(ctypes.windll.user32.GetAsyncKeyState(_VK_MENU) & 0x8000)
+        except Exception:
+            return None
+else:
+    def _system_alt_state() -> bool | None:
+        return None
+
+
+_ALT_KEY_STATE = False
+_ALT_TIMER_RUNNING = False
+_SELECTION_HISTORY: list[str] = []
+_OPERATOR_PROPS_ID = "OBJECT_OT_replace_with_copy"
+_USE_ACTIVE_DEFAULT = False
+
+
+def _tag_all_areas():
+    wm = None
+    try:
+        wm = bpy.context.window_manager  # type: ignore[attr-defined]
+    except Exception:
+        wm = None
+    if wm is None:
+        return
+    for window in wm.windows:
+        screen = getattr(window, "screen", None)
+        if screen is None:
+            continue
+        for area in screen.areas:
+            try:
+                area.tag_redraw()
+            except Exception:
+                continue
+
+
+def _set_alt_state(state: bool):
+    global _ALT_KEY_STATE
+    if state == _ALT_KEY_STATE:
+        return
+    _ALT_KEY_STATE = state
+    _tag_all_areas()
+
+
+def _extract_alt(window):
+    if window is None:
+        return None
+    for attr_name in ("event_state_get", "eventstate"):
+        attr = getattr(window, attr_name, None)
+        if attr is None:
+            continue
+        try:
+            event = attr() if callable(attr) else attr
+        except Exception:
+            continue
+        if event is not None:
+            return bool(getattr(event, "alt", False))
+    return None
+
+
+def _read_alt_state(context=None) -> bool:
+    system_alt = _system_alt_state()
+    if system_alt is not None:
+        return system_alt
+
+    windows = []
+    if context is not None:
+        window = getattr(context, "window", None)
+        if window is not None:
+            windows.append(window)
+        wm = getattr(context, "window_manager", None)
+        if wm is not None:
+            for win in wm.windows:
+                if win not in windows:
+                    windows.append(win)
+    else:
+        wm = getattr(bpy.context, "window_manager", None)  # type: ignore[attr-defined]
+        if wm is not None:
+            windows.extend(wm.windows)
+
+    for win in windows:
+        alt = _extract_alt(win)
+        if alt is not None:
+            return alt
+    return False
+
+
+def _alt_timer():
+    global _ALT_TIMER_RUNNING
+    if not _ALT_TIMER_RUNNING:
+        return None
+    try:
+        _update_selection_history()
+        state = _read_alt_state()
+        _set_alt_state(state)
+    except Exception:
+        pass
+    return 0.1
+
+
+def _ensure_alt_timer():
+    global _ALT_TIMER_RUNNING
+    if _ALT_TIMER_RUNNING:
+        return
+    _ALT_TIMER_RUNNING = True
+    bpy.app.timers.register(_alt_timer, first_interval=0.1)
+
+
+def _stop_alt_timer():
+    global _ALT_TIMER_RUNNING
+    _ALT_TIMER_RUNNING = False
+
+
+def _update_selection_history(context=None):
+    global _SELECTION_HISTORY
+    try:
+        source = context if context is not None else bpy.context  # type: ignore[attr-defined]
+        selected = list(getattr(source, "selected_objects", []))
+    except Exception:
+        selected = []
+    selected_names = {obj.name for obj in selected}
+    _SELECTION_HISTORY = [name for name in _SELECTION_HISTORY if name in selected_names]
+    for obj in selected:
+        if obj.name not in _SELECTION_HISTORY:
+            _SELECTION_HISTORY.append(obj.name)
+
+
+def _get_operator_bool_setting(context, prop_name: str, default: bool) -> bool:
+    wm = getattr(context, "window_manager", None)
+    if wm is None:
+        return default
+
+    getter = getattr(wm, "operator_properties_last", None)
+    if getter is not None:
+        try:
+            props = getter(_OPERATOR_PROPS_ID)
+        except Exception:
+            props = None
+        if props is not None and hasattr(props, prop_name):
+            try:
+                return bool(getattr(props, prop_name))
+            except Exception:
+                pass
+    return default
+
+
+def _unique_selected(objs, allowed_names=None):
+    seen = set()
+    result = []
+    for obj in objs:
+        if obj is None:
+            continue
+        name = getattr(obj, "name", None)
+        if not name or name in seen or (allowed_names is not None and name not in allowed_names):
+            continue
+        result.append(obj)
+        seen.add(name)
+    return result
+
+
+@dataclass
+class SelectionState:
+    """Snapshot of the current object selection and its ordering."""
+    selected: list[bpy.types.Object]
+    active: bpy.types.Object | None
+    order: list[bpy.types.Object]
+
+    def resolve_template(self, use_active: bool) -> bpy.types.Object | None:
+        if not self.selected:
+            return None
+
+        if use_active:
+            if self.active and self.active in self.selected:
+                return self.active
+            return self.order[-1] if self.order else self.selected[0]
+
+        for obj in self.order:
+            if obj != self.active:
+                return obj
+
+        for obj in self.selected:
+            if obj != self.active:
+                return obj
+
+        return self.active if self.active in self.selected else self.selected[0]
+
+    def targets_for(self, template: bpy.types.Object | None) -> list[bpy.types.Object]:
+        if template is None:
+            return list(self.order)
+        return [obj for obj in self.order if obj != template]
+
+
+def _selection_snapshot(context) -> SelectionState:
+    """Collect a deterministic view of the selection for menu labels and execution."""
+    _update_selection_history(context)
+
+    selected = _unique_selected(getattr(context, "selected_editable_objects", []), None)
+    selected_names = {obj.name for obj in selected}
+
+    view_layer = getattr(context, "view_layer", None)
+    active = None
+    if view_layer is not None:
+        objects = getattr(view_layer, "objects", None)
+        if objects is not None:
+            active = getattr(objects, "active", None)
+
+    selection_order = getattr(context, "selected_objects", None)
+    if selection_order:
+        ordered = _unique_selected(selection_order, selected_names)
+    else:
+        ordered = _unique_selected(selected, selected_names)
+
+    if active and getattr(active, "name", None) in selected_names and active not in ordered:
+        ordered.append(active)
+
+    # Rehydrate history into an ordered list of currently selected objects.
+    history_objs = []
+    for name in _SELECTION_HISTORY:
+        if name not in selected_names:
+            continue
+        obj = bpy.data.objects.get(name)
+        if obj is not None:
+            history_objs.append(obj)
+
+    if history_objs:
+        ordered = _unique_selected(history_objs + ordered, selected_names)
+
+    return SelectionState(selected=selected, active=active, order=ordered)
+
 
 def _copy_loc_rot(dst, src):
     # Match rotation mode first
@@ -21,9 +257,35 @@ def _copy_loc_rot(dst, src):
     dst.location = src.location.copy()
 
 
+def _is_alt_pressed(context) -> bool:
+    state = _read_alt_state(context)
+    _set_alt_state(state)
+    return state
+
+
+def _menu_label(context) -> str:
+    selection = _selection_snapshot(context) if context is not None else SelectionState([], None, [])
+    if not selection.selected:
+        return "Replace with Copy (select template first)"
+
+    use_active = _get_operator_bool_setting(context, "use_active_as_template", _USE_ACTIVE_DEFAULT) if context else _USE_ACTIVE_DEFAULT
+
+    template = selection.resolve_template(use_active)
+    targets = selection.targets_for(template)
+
+    template_name = template.name if template is not None else "template"
+    count = len(targets)
+    target_label = "object" if count == 1 else "objects"
+
+    if _is_alt_pressed(context):
+        return f"Replace {count} {target_label} with a reference to {template_name}"
+    return f"Replace {count} {target_label} with a copy of {template_name}"
+
+
 class OBJECT_OT_replace_with_copy(bpy.types.Operator):
     """Replace selected objects with copies of the template.\n
-    Default: first selected (non-active) is template. Enable the option to use the active object instead."""
+    Default: first selected (non-active) is template. Enable the option to use the active object instead.\n
+    Hold Alt while invoking to keep the new copies linked to the template data."""
     bl_idname = "object.replace_with_copy"
     bl_label = "Replace With Copy"
     bl_options = {'REGISTER', 'UNDO'}
@@ -36,47 +298,49 @@ class OBJECT_OT_replace_with_copy(bpy.types.Operator):
 
     make_unique_data: bpy.props.BoolProperty(
         name="Make Unique Mesh/Data",
-        description="Copy object data (mesh/curve/etc.) so replacements do not share data with the template",
-        default=False,
+        description="Copy object data (mesh/curve/etc.) so replacements do not share data with the template; hold Alt to keep data linked",
+        default=True,
     )
 
     match_scale: bpy.props.BoolProperty(
-        name="Also Match Scale",
-        description="If enabled, the copy will take the target's scale. If disabled, it keeps the template's scale",
-        default=False,
+        name="Match Target Scale",
+        description="If enabled, the copy takes each target's scale; disable to keep the template's original scale",
+        default=True,
     )
 
     @classmethod
     def poll(cls, context):
         return context.mode == 'OBJECT' and len(context.selected_editable_objects) >= 2
 
+    def invoke(self, context, event):
+        use_linked_data = bool(getattr(event, "alt", False))
+        self.make_unique_data = not use_linked_data
+        return self.execute(context)
+
     def execute(self, context):
-        sel = list(context.selected_editable_objects)
-        if not sel:
+        selection = _selection_snapshot(context)
+        if not selection.selected:
             self.report({'ERROR'}, "Nothing selected")
             return {'CANCELLED'}
 
-        active = context.view_layer.objects.active
-        if active is None:
+        if selection.active is None:
             self.report({'ERROR'}, "No active object")
             return {'CANCELLED'}
 
-        # Decide template
-        template = None
-        if self.use_active_as_template:
-            template = active
-            targets = [o for o in sel if o != template]
-        else:
-            # Use the first non-active selected as template; everything else are targets
-            non_active = [o for o in sel if o != active]
-            if not non_active:
-                self.report({'ERROR'}, "Need at least one non-active selected object to use as template")
-                return {'CANCELLED'}
-            template = non_active[0]
-            targets = [o for o in sel if o != template]
+        use_active = bool(self.use_active_as_template)
+
+        template = selection.resolve_template(use_active)
+        if template is None:
+            self.report({'ERROR'}, "Unable to determine template object")
+            return {'CANCELLED'}
+
+        targets = selection.targets_for(template)
 
         if not targets:
-            self.report({'ERROR'}, "Select at least one target in addition to the template")
+            if use_active:
+                self.report({'ERROR'}, "Select at least one target object in addition to the active template")
+            else:
+                self.report({'ERROR'}, "Need at least one non-active selected object to use as template")
             return {'CANCELLED'}
 
         # Process each target
@@ -84,9 +348,6 @@ class OBJECT_OT_replace_with_copy(bpy.types.Operator):
         scene_coll = context.scene.collection
 
         for tgt in targets:
-            if tgt == template:
-                continue
-
             tgt_name = tgt.name_full
             tgt_selected = tgt.select_get()
             tgt_parent = tgt.parent
@@ -198,12 +459,14 @@ _MENU_HANDLE = None
 
 def register():
     global _MENU_HANDLE
+    _ensure_alt_timer()
+    _SELECTION_HISTORY.clear()
     for cls in classes:
         bpy.utils.register_class(cls)
     _MENU_HANDLE = register_menu_item(
         menu="VIEW3D_MT_object",
         operator=OBJECT_OT_replace_with_copy,
-        label="Replace With Copy",
+        label=_menu_label,
         anchor_operator="object.join",
         before_anchor=True,
     )
@@ -212,6 +475,8 @@ def register():
 
 def unregister():
     global _MENU_HANDLE
+    _stop_alt_timer()
+    _SELECTION_HISTORY.clear()
     if _MENU_HANDLE is not None:
         unregister_menu_item(_MENU_HANDLE)
         _MENU_HANDLE = None

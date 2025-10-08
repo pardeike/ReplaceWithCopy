@@ -1,6 +1,6 @@
 """
-Menu Injection Helper
-=====================
+Menu Injection Helper v1.1
+==========================
 
 This module provides a reusable helper for inserting custom operators into
 Blender menus without re-implementing Blender's stock draw functions.  It is
@@ -47,8 +47,9 @@ Parameter Reference
     Operator triggered by the new menu entry.  You may pass the id string or
     the operator class; the helper extracts ``bl_idname`` automatically.
 
-``label`` (str):
-    Text displayed in the menu.
+``label`` (str | Callable[[Context], str]):
+    Text displayed in the menu. When a callable is provided it is evaluated each
+    time the menu draws and receives the current :class:`bpy.types.Context`.
 
 ``anchor_operator`` (str | None):
     RNA operator id used as positional anchor.  When ``None`` the new entry is
@@ -99,6 +100,7 @@ __all__ = [
 MenuRef = Union[str, type]
 OperatorRef = Union[str, type]
 EnableCallback = Optional[Callable[[bpy.types.Context], bool]]
+LabelProvider = Union[str, Callable[[bpy.types.Context], str]]
 
 
 @dataclass(slots=True)
@@ -117,7 +119,8 @@ class MenuInjectionHandle:
     operator_id:
         RNA id of the operator triggered by the menu item.
     label:
-        Display text shown in the UI.
+        Display text shown in the UI. May be a string or a callable that
+        receives the current draw context and returns the label.
     icon:
         Blender icon identifier string.
     is_enabled:
@@ -130,7 +133,7 @@ class MenuInjectionHandle:
     anchor_operator: Optional[str]
     before_anchor: bool
     operator_id: str
-    label: str
+    label: LabelProvider
     icon: str
     is_enabled: EnableCallback
     operator_settings: Optional[Dict[str, Any]]
@@ -163,7 +166,15 @@ class _MenuDrawManager:
         layout = self.layout if handle.is_enabled is None else self.layout.row()
         if handle.is_enabled is not None:
             layout.enabled = bool(handle.is_enabled(self.context))
-        button = layout.operator(handle.operator_id, text=handle.label, icon=handle.icon)
+        if callable(handle.label):
+            try:
+                label_value = handle.label(self.context)
+            except Exception:
+                label_value = ""
+        else:
+            label_value = handle.label
+        label_str = "" if label_value is None else str(label_value)
+        button = layout.operator(handle.operator_id, text=label_str, icon=handle.icon)
         if handle.operator_settings:
             for attr, value in handle.operator_settings.items():
                 setattr(button, attr, value)
@@ -258,7 +269,7 @@ def register_menu_item(
     *,
     menu: MenuRef,
     operator: OperatorRef,
-    label: str,
+    label: LabelProvider,
     anchor_operator: Optional[str] = None,
     before_anchor: bool = True,
     icon: str = "NONE",

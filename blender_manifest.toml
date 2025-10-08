@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 
-id = "replacewithcopy"
+id = "replace_with_copy"
 version = "1.0.0"
 name = "Replace With Copy"
 tagline = "Batch replace multiple objects with a template"

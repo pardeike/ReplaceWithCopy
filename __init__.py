@@ -467,8 +467,8 @@ def register():
         menu="VIEW3D_MT_object",
         operator=OBJECT_OT_replace_with_copy,
         label=_menu_label,
-        anchor_operator="object.join",
-        before_anchor=True,
+        anchor_operator="object.duplicate_move_linked",
+        before_anchor=False,
     )
     print("Registered ReplaceWithCopy")
 

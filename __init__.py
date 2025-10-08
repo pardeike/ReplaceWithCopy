@@ -23,15 +23,15 @@ def _copy_loc_rot(dst, src):
 
 class OBJECT_OT_replace_with_copy(bpy.types.Operator):
     """Replace selected objects with copies of the template.\n
-    Default: ACTIVE is template. Hold Alt on invoke to use non-active as template."""
+    Default: first selected (non-active) is template. Enable the option to use the active object instead."""
     bl_idname = "object.replace_with_copy"
     bl_label = "Replace With Copy"
     bl_options = {'REGISTER', 'UNDO'}
 
     use_active_as_template: bpy.props.BoolProperty(
         name="Active is Template",
-        description="If enabled, the active object is used as the template; otherwise the first non-active selected is used as template",
-        default=True,
+        description="If enabled, the active object (usually last selected) is used as the template; otherwise the first non-active selected is used",
+        default=False,
     )
 
     make_unique_data: bpy.props.BoolProperty(
@@ -49,12 +49,6 @@ class OBJECT_OT_replace_with_copy(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         return context.mode == 'OBJECT' and len(context.selected_editable_objects) >= 2
-
-    def invoke(self, context, event):
-        # Alt inverts the default to support the “template first, then targets” workflow.
-        if hasattr(event, "alt") and event.alt:
-            self.use_active_as_template = False
-        return self.execute(context)
 
     def execute(self, context):
         sel = list(context.selected_editable_objects)
@@ -94,11 +88,24 @@ class OBJECT_OT_replace_with_copy(bpy.types.Operator):
                 continue
 
             tgt_name = tgt.name_full
+            tgt_selected = tgt.select_get()
             tgt_parent = tgt.parent
             tgt_parent_type = tgt.parent_type
             tgt_parent_bone = tgt.parent_bone
             tgt_parent_inv = tgt.matrix_parent_inverse.copy()
             tgt_users_colls = list(tgt.users_collection)
+            tgt_children_info = [
+                (child, child.matrix_world.copy(), child.parent_type, child.parent_bone)
+                for child in tgt.children
+            ]
+            try:
+                tgt_hidden_view = tgt.hide_get(view_layer=view_layer)
+            except (TypeError, RuntimeError):
+                try:
+                    tgt_hidden_view = tgt.hide_get()
+                except Exception:
+                    tgt_hidden_view = False
+            tgt_hide_render = tgt.hide_render
 
             # Create copy
             new_obj = template.copy()
@@ -122,11 +129,50 @@ class OBJECT_OT_replace_with_copy(bpy.types.Operator):
             new_obj.matrix_parent_inverse = tgt_parent_inv
 
             # Transforms: copy loc+rot from target, scale per option
-            _copy_loc_rot(new_obj, tgt if True else template)  # loc+rot from target
+            _copy_loc_rot(new_obj, tgt)
             if self.match_scale:
                 new_obj.scale = tgt.scale.copy()
             else:
                 new_obj.scale = template.scale.copy()
+
+            # Ensure visibility and selection mirror the target
+            new_obj.hide_render = tgt_hide_render
+            try:
+                new_obj.hide_set(tgt_hidden_view, view_layer=view_layer)
+            except (TypeError, RuntimeError):
+                try:
+                    new_obj.hide_set(tgt_hidden_view)
+                except Exception:
+                    pass
+            try:
+                new_obj.select_set(tgt_selected)
+            except Exception:
+                pass
+
+            # Update external references from target to new object
+            try:
+                bpy.data.user_remap(from_=tgt, to=new_obj)
+            except AttributeError:
+                # Blender versions prior to 3.0 used positional args
+                try:
+                    bpy.data.user_remap(tgt, new_obj)
+                except Exception:
+                    pass
+
+            # Reparent children while preserving their transforms
+            try:
+                new_parent_inv = new_obj.matrix_world.inverted()
+            except Exception:
+                new_parent_inv = None
+
+            for child, child_world, child_parent_type, child_parent_bone in tgt_children_info:
+                child.parent = new_obj
+                child.parent_type = child_parent_type
+                if child_parent_type == 'BONE':
+                    child.parent_bone = child_parent_bone
+                child.matrix_world = child_world
+                if new_parent_inv is not None:
+                    child.matrix_parent_inverse = new_parent_inv @ child_world
 
             # Delete target, then take its name
             # Ensure target is unlinked properly

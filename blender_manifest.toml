@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "replace_with_copy"
-version = "1.0.0"
+version = "1.0.1"
 name = "Replace With Copy"
 tagline = "Batch replace multiple objects with a template"
 maintainer = "Brrainz <andreas@pardeike.net>"
@@ -17,4 +17,14 @@ license = [
 
 copyright = [
   "2025 Andreas Pardeike",
+]
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  ".*",
+  "*.bat",
+  "*.afphoto",
+  "*.png",
+  "*.zip"
 ]

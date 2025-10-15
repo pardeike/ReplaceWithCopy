@@ -1,5 +1,7 @@
 # Replace With Copy
 
+<img alt="ReplaceWithCopyScreenshot" src="https://github.com/user-attachments/assets/43f8dd3c-b2b2-4e09-b4e3-923691e5ef95" />
+
 Replace the selected objects with copies of the template object while keeping their transforms and scene placement intact.
 
 ## Highlights
